@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""
+Single-file simple calculator (Python 3)
+
+Features combined:
+- Safe expression evaluator using AST (no eval) with math functions and constants.
+- CLI: evaluate single expression or interactive REPL.
+- GUI: simple Tkinter interface (run with --gui).
+- Built-in unit tests (run with --test).
+
+Usage:
+- Interactive REPL: python3 calculator.py
+- Evaluate expression: python3 calculator.py "2 + 3*(4-1)"
+- GUI: python3 calculator.py --gui
+- Run tests: python3 calculator.py --test
+"""
+
+from __future__ import annotations
+import ast
+import math
+import operator as op
+import sys
+import argparse
+from typing import Any
+
+# --- Evaluator --------------------------------------------------------------
+
+# Supported binary operators
+_BIN_OPS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.FloorDiv: op.floordiv,
+    ast.Mod: op.mod,
+    ast.Pow: op.pow,
+}
+
+# Supported unary operators
+_UNARY_OPS = {
+    ast.UAdd: lambda x: +x,
+    ast.USub: lambda x: -x,
+}
+
+# Allowed math functions exposed to caller
+_ALLOWED_FUNCS = {
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "asin": math.asin,
+    "acos": math.acos,
+    "atan": math.atan,
+    "log": math.log,      # natural log; log(x, base) works
+    "log10": math.log10,
+    "exp": math.exp,
+    "sqrt": math.sqrt,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "fabs": math.fabs,
+    "pow": math.pow,
+}
+
+# Allowed constants
+_ALLOWED_CONSTS = {
+    "pi": math.pi,
+    "e": math.e,
+}
+
+
+class EvalError(ValueError):
+    """Raised for evaluation errors in expressions."""
+    pass
+
+
+def _safe_eval(node: ast.AST) -> Any:
+    """Recursively evaluate an AST node, permitting only safe operations."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval(node.body)
+
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval(node.left)
+        right = _safe_eval(node.right)
+        op_type = type(node.op)
+        func = _BIN_OPS.get(op_type)
+        if func is None:
+            raise EvalError(f"Unsupported binary operator: {op_type.__name__}")
+        return func(left, right)
+
+    if isinstance(node, ast.UnaryOp):
+        operand = _safe_eval(node.operand)
+        op_type = type(node.op)
+        func = _UNARY_OPS.get(op_type)
+        if func is None:
+            raise EvalError(f"Unsupported unary operator: {op_type.__name__}")
+        return func(operand)
+
+    if isinstance(node, ast.Call):
+        # Only allow direct function calls like sin(x), no attributes, no keywords.
+        if not isinstance(node.func, ast.Name):
+            raise EvalError("Only direct function calls are allowed (no attributes).")
+        func_name = node.func.id
+        func = _ALLOWED_FUNCS.get(func_name)
+        if func is None:
+            raise EvalError(f"Function '{func_name}' is not allowed.")
+        if node.keywords:
+            raise EvalError("Keyword arguments are not allowed in function calls.")
+        args = [_safe_eval(arg) for arg in node.args]
+        try:
+            return func(*args)
+        except TypeError as e:
+            raise EvalError(f"Error calling function {func_name}: {e}")
+        except ValueError as e:
+            # math domain errors, rewrap as EvalError
+            raise EvalError(f"Error calling function {func_name}: {e}")
+        except Exception:
+            # For any other unexpected exception, wrap
+            raise EvalError(f"Error calling function {func_name}")
+
+    if isinstance(node, ast.Name):
+        name = node.id
+        if name in _ALLOWED_CONSTS:
+            return _ALLOWED_CONSTS[name]
+        raise EvalError(f"Unknown identifier: {name}")
+
+    # ast.Constant in Python 3.8+, ast.Num older
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise EvalError("Only integer and float constants are allowed")
+    if isinstance(node, ast.Num):  # backward compat
+        return node.n
+
+    raise EvalError(f"Unsupported expression element: {type(node).__name__}")
+
+
+def evaluate(expr: str) -> Any:
+    """Parse and safely evaluate an arithmetic expression string."""
+    if not isinstance(expr, str):
+        raise EvalError("Expression must be a string")
+    try:
+        parsed = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        raise EvalError(f"Syntax error in expression: {e}")
+    return _safe_eval(parsed)
+
+
+def _format_result(res: Any) -> str:
+    if isinstance(res, float):
+        # Display integers without trailing .0
+        if res.is_integer():
+            return str(int(res))
+        return str(res)
+    return str(res)
+
+
+# --- CLI / REPL -------------------------------------------------------------
+
+def repl():
+    banner = (
+        "Simple Python calculator (safe). Type an expression and press Enter.\n"
+        "Supported operators: + - * / // % ** and parentheses.\n"
+        "Supported functions: " + ", ".join(sorted(_ALLOWED_FUNCS.keys())) + "\n"
+        "Constants: " + ", ".join(sorted(_ALLOWED_CONSTS.keys())) + "\n"
+        "Commands: help, quit, exit\n"
+    )
+    print(banner)
+    try:
+        while True:
+            try:
+                line = input("calc> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()  # newline and exit REPL
+                break
+
+            if not line:
+                continue
+            cmd = line.lower().strip()
+            if cmd in ("quit", "exit"):
+                break
+            if cmd == "help":
+                print("Enter arithmetic expressions, e.g. sin(pi/2) or 2 + 3*(4-1). Type quit or exit to leave.")
+                continue
+
+            try:
+                result = evaluate(line)
+            except Exception as e:
+                print("Error:", e)
+                continue
+
+            print(_format_result(result))
+    except KeyboardInterrupt:
+        print()
+
+
+# --- GUI -------------------------------------------------------------------
+
+def run_gui():
+    """Run a simple Tkinter GUI. This import is local so script can run headless CLI/tests."""
+    try:
+        import tkinter as tk
+        from tkinter import scrolledtext
+    except Exception as e:
+        print("Tkinter is not available or cannot be imported:", e, file=sys.stderr)
+        return
+
+    class CalculatorGUI:
+        def __init__(self, root):
+            self.root = root
+            root.title("Simple Calculator")
+
+            self.entry = tk.Entry(root, font=("Arial", 14))
+            self.entry.pack(fill="x", padx=8, pady=8)
+            self.entry.bind("<Return>", self._on_eval)
+
+            btn_frame = tk.Frame(root)
+            btn_frame.pack(fill="x", padx=8)
+            eval_btn = tk.Button(btn_frame, text="Evaluate", command=self._on_eval)
+            eval_btn.pack(side="left")
+
+            clear_btn = tk.Button(btn_frame, text="Clear", command=self._on_clear)
+            clear_btn.pack(side="left", padx=(8, 0))
+
+            self.output = tk.Label(root, text="", anchor="w", justify="left", font=("Arial", 12))
+            self.output.pack(fill="x", padx=8, pady=(6, 0))
+
+            self.history = scrolledtext.ScrolledText(root, height=10, state="disabled", font=("Courier", 11))
+            self.history.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def _on_eval(self, event=None):
+            expr = self.entry.get().strip()
+            if not expr:
+                return
+            try:
+                res = evaluate(expr)
+                out = _format_result(res)
+                self._append_history(f"> {expr}\n= {out}\n\n")
+                self.output.config(text=out, fg="black")
+            except Exception as e:
+                self._append_history(f"> {expr}\n! Error: {e}\n\n")
+                self.output.config(text=f"Error: {e}", fg="red")
+
+        def _on_clear(self):
+            self.entry.delete(0, tk.END)
+            self.output.config(text="")
+
+        def _append_history(self, text):
+            self.history.configure(state="normal")
+            self.history.insert(tk.END, text)
+            self.history.configure(state="disabled")
+            self.history.see(tk.END)
+
+    root = tk.Tk()
+    app = CalculatorGUI(root)
+    root.mainloop()
+
+
+# --- Built-in tests (unittest) ---------------------------------------------
+
+def _run_tests():
+    import unittest
+
+    class EvalTests(unittest.TestCase):
+        def approx(self, a, b, tol=1e-9):
+            return abs(a - b) <= tol
+
+        def test_basic_arithmetic(self):
+            self.assertEqual(evaluate("1+2"), 3)
+            self.assertEqual(evaluate("2*3+4"), 10)
+            self.assertEqual(evaluate("2**3"), 8)
+            self.assertEqual(evaluate("10//3"), 3)
+            self.assertAlmostEqual(evaluate("10/4"), 2.5)
+
+        def test_unary_and_parentheses(self):
+            self.assertEqual(evaluate("-3"), -3)
+            self.assertEqual(evaluate("+3"), 3)
+            self.assertEqual(evaluate("2*(3+4)"), 14)
+
+        def test_functions_and_constants(self):
+            self.assertAlmostEqual(evaluate("sin(pi/2)"), 1.0, places=9)
+            self.assertAlmostEqual(evaluate("cos(0)"), 1.0, places=9)
+            self.assertAlmostEqual(evaluate("log(e)"), 1.0, places=9)
+            self.assertAlmostEqual(evaluate("sqrt(16)"), 4.0, places=9)
+            self.assertAlmostEqual(evaluate("pow(2,3)"), 8.0, places=9)
+            self.assertAlmostEqual(evaluate("log10(100)"), 2.0, places=9)
+
+        def test_errors_and_bad_input(self):
+            with self.assertRaises(EvalError):
+                evaluate("import os")
+            with self.assertRaises(EvalError):
+                evaluate("__import__('os')")
+            with self.assertRaises(EvalError):
+                evaluate("open('file')")
+            with self.assertRaises(EvalError):
+                evaluate("foo")
+
+        def test_wrong_function_usage(self):
+            with self.assertRaises(EvalError):
+                evaluate("sin()")
+
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(EvalTests)
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    if not result.wasSuccessful():
+        sys.exit(1)
+
+
+# --- Main ------------------------------------------------------------------
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="calculator.py", description="Simple safe calculator")
+    parser.add_argument("expr", nargs="*", help="Expression to evaluate (quote if it contains spaces)")
+    parser.add_argument("--gui", action="store_true", help="Run the Tkinter GUI")
+    parser.add_argument("--test", action="store_true", help="Run built-in unit tests")
+    args = parser.parse_args(argv)
+
+    if args.test:
+        _run_tests()
+        return
+
+    if args.gui:
+        run_gui()
+        return
+
+    if args.expr:
+        expr = " ".join(args.expr)
+        try:
+            res = evaluate(expr)
+        except Exception as e:
+            print("Error:", e, file=sys.stderr)
+            sys.exit(1)
+        print(_format_result(res))
+        return
+
+    # default: interactive REPL
+    repl()
+
+
+if __name__ == "__main__":
+    main()
